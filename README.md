@@ -46,9 +46,13 @@ https://optivault.ai.studio/
 
 # 📄 License
 
-The Android wrapper code in this repository is licensed under the MIT License.
+## License
 
-This license applies only to the Android application code created for this repository. It does not grant ownership or rights to the OptiVault website, branding, content, logo, or other assets belonging to their respective owner.
+The Android wrapper source code in this repository is licensed under the MIT License.
+
+This license applies only to the Android application code created for this project.
+
+It does not grant ownership of or rights to the OptiVault website, branding, content, functionality, or services. Full credit and ownership of the original OptiVault project remain with Bishing, the original creator.
 
 ❤️ Credits
 
