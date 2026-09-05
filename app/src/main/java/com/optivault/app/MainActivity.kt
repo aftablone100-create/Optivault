@@ -3,6 +3,7 @@ package com.optivault.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -12,8 +13,11 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
+import android.util.Base64
 import android.view.View
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
@@ -31,6 +35,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -50,11 +57,13 @@ class MainActivity : AppCompatActivity() {
         "jar", "zip", "rar", "7z", "mcpack", "mcworld", "mcaddon", "apk"
     )
 
-    // Held while we wait on a runtime storage-permission result (API <= 28 only)
-    private var pendingDownloadUrl: String? = null
-    private var pendingDownloadUserAgent: String? = null
-    private var pendingDownloadContentDisposition: String? = null
-    private var pendingDownloadMimeType: String? = null
+    // Pending request info, used only while waiting on a runtime storage
+    // permission result (API 28 and below — API 29+ never needs this).
+    private var pendingIsBlob = false
+    private var pendingUrl: String? = null
+    private var pendingUserAgent: String? = null
+    private var pendingContentDisposition: String? = null
+    private var pendingMimeType: String? = null
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -76,12 +85,11 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            startDownload(
-                pendingDownloadUrl,
-                pendingDownloadUserAgent,
-                pendingDownloadContentDisposition,
-                pendingDownloadMimeType
-            )
+            if (pendingIsBlob) {
+                pendingUrl?.let { handleBlobDownload(it, pendingContentDisposition, pendingMimeType) }
+            } else {
+                startDownload(pendingUrl, pendingUserAgent, pendingContentDisposition, pendingMimeType)
+            }
         } else {
             Toast.makeText(
                 this,
@@ -89,10 +97,11 @@ class MainActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
-        pendingDownloadUrl = null
-        pendingDownloadUserAgent = null
-        pendingDownloadContentDisposition = null
-        pendingDownloadMimeType = null
+        pendingIsBlob = false
+        pendingUrl = null
+        pendingUserAgent = null
+        pendingContentDisposition = null
+        pendingMimeType = null
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -123,6 +132,9 @@ class MainActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
 
+        // Bridge used to pull blob: data out of the page and save it natively.
+        webView.addJavascriptInterface(BlobDownloadInterface(), "AndroidBlobDownloader")
+
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView,
@@ -130,8 +142,13 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 val url = request.url
 
-                // Route known download file types straight to DownloadManager,
-                // even when they're on the same host as the site.
+                // Client-generated files (e.g. mods.zip built in JS) arrive as blob: URLs.
+                if (url.scheme == "blob") {
+                    handleBlobDownload(url.toString(), null, null)
+                    return true
+                }
+
+                // Known download file types, even on the same host as the site.
                 if (isDownloadableUrl(url)) {
                     startDownload(url.toString(), null, null, null)
                     return true
@@ -183,11 +200,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Catches downloads triggered via JS, redirects, blob URLs, or any
-        // response the WebView itself can't render (Content-Disposition:
-        // attachment, unknown mimetype, etc.)
+        // Catches downloads triggered via JS/redirects that don't go through
+        // shouldOverrideUrlLoading (including blob: URLs on some Android versions).
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-            startDownload(url, userAgent, contentDisposition, mimeType)
+            if (url.startsWith("blob:")) {
+                handleBlobDownload(url, contentDisposition, mimeType)
+            } else {
+                startDownload(url, userAgent, contentDisposition, mimeType)
+            }
         }
 
         swipeRefresh.setOnRefreshListener { loadSite() }
@@ -199,6 +219,8 @@ class MainActivity : AppCompatActivity() {
         return ext in downloadableExtensions
     }
 
+    // --- Normal http(s) downloads (unchanged behavior) ---
+
     private fun startDownload(
         url: String?,
         userAgent: String?,
@@ -207,16 +229,15 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (url == null) return
 
-        // Android 9 (API 28) and below require the runtime permission to
-        // write into the public Downloads folder. API 29+ does not.
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            pendingDownloadUrl = url
-            pendingDownloadUserAgent = userAgent
-            pendingDownloadContentDisposition = contentDisposition
-            pendingDownloadMimeType = mimeType
+            pendingIsBlob = false
+            pendingUrl = url
+            pendingUserAgent = userAgent
+            pendingContentDisposition = contentDisposition
+            pendingMimeType = mimeType
             storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             return
         }
@@ -248,6 +269,116 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
+
+    // --- blob: downloads (the fix) ---
+
+    private fun handleBlobDownload(url: String, contentDisposition: String?, mimeType: String?) {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingIsBlob = true
+            pendingUrl = url
+            pendingContentDisposition = contentDisposition
+            pendingMimeType = mimeType
+            storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            return
+        }
+
+        val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() } ?: "application/zip"
+        val fileName = URLUtil.guessFileName(url, contentDisposition, resolvedMimeType)
+
+        val escapedUrl = JSONObject.quote(url)
+        val escapedFileName = JSONObject.quote(fileName)
+        val escapedMimeType = JSONObject.quote(resolvedMimeType)
+
+        // Reads the blob inside the page and hands the bytes to Kotlin as Base64,
+        // since DownloadManager cannot fetch blob: URLs itself.
+        val js = """
+            (function() {
+                try {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('GET', $escapedUrl, true);
+                    xhr.responseType = 'blob';
+                    xhr.onload = function() {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            var base64 = reader.result.split(',')[1];
+                            AndroidBlobDownloader.saveBase64File(base64, $escapedFileName, $escapedMimeType);
+                        };
+                        reader.onerror = function() {
+                            AndroidBlobDownloader.onError('Could not read file data');
+                        };
+                        reader.readAsDataURL(xhr.response);
+                    };
+                    xhr.onerror = function() {
+                        AndroidBlobDownloader.onError('Network error reading file');
+                    };
+                    xhr.send();
+                } catch (e) {
+                    AndroidBlobDownloader.onError(e.message);
+                }
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js, null)
+        Toast.makeText(this, "Preparing $fileName…", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun saveBytesToDownloads(fileName: String, mimeType: String, bytes: ByteArray): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return false
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: return false
+                true
+            } else {
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                FileOutputStream(File(downloadsDir, fileName)).use { it.write(bytes) }
+                true
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private inner class BlobDownloadInterface {
+        @JavascriptInterface
+        fun saveBase64File(base64Data: String, fileName: String, mimeType: String) {
+            val saved = try {
+                val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                saveBytesToDownloads(fileName, mimeType, bytes)
+            } catch (e: Exception) {
+                false
+            }
+            runOnUiThread {
+                Toast.makeText(
+                    this@MainActivity,
+                    if (saved) "Saved $fileName to Downloads" else "Failed to save $fileName",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
+        @JavascriptInterface
+        fun onError(message: String?) {
+            runOnUiThread {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Download failed: ${message ?: "unknown error"}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    // --- Unchanged from before ---
 
     private fun loadSite() {
         if (isNetworkAvailable()) {
